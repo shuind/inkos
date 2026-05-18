@@ -25,7 +25,7 @@ Open-source AI Agent that autonomously writes, audits, and revises novels — wi
 
 **InkOS TUI is here!** — run `inkos tui` to launch a full-screen interactive dashboard. Conversational creation, natural-language book operations, slash command autocomplete, themed animations — TUI, Studio, and OpenClaw share the same interaction kernel.
 
-**v1.3.12 Studio service links update** — adds quick links for [kkaiapi](https://en.kkaiapi.com) and OpenRouter in Studio service setup, including homepage, docs, and model pages, and renames the aggregator group to Aggregator API.
+**v1.4.0 short-fiction and Studio Chat workflow update** — Studio Chat and CLI can now create standalone short-fiction packages with synopsis, selling points, cover prompts, and optional cover images; project chat sessions persist across reloads and generated artifacts can be previewed and edited.
 
 **New: short fiction writing and cover generation!** — Studio chat and CLI can now create a standalone short-fiction package: complete draft, outline and review records, synopsis, selling points, cover prompt, and an optional generated cover image when a cover provider is configured.
 
