@@ -68,6 +68,14 @@ describe("fetchJson", () => {
 describe("deriveInvalidationPaths", () => {
   it("refreshes book collections after creating a book", () => {
     expect(deriveInvalidationPaths("/books/create")).toEqual(["/api/v1/books"]);
+    expect(deriveInvalidationPaths("/books/workbench-create")).toEqual(["/api/v1/books"]);
+    expect(deriveInvalidationPaths("/creative-drafts/draft-1/create-book")).toEqual(["/api/v1/books"]);
+  });
+
+  it("refreshes creative draft state after draft mutations", () => {
+    expect(deriveInvalidationPaths("/creative-drafts")).toEqual(["/api/v1/creative-drafts/latest"]);
+    expect(deriveInvalidationPaths("/creative-drafts/draft-1/analyze")).toEqual(["/api/v1/creative-drafts/latest"]);
+    expect(deriveInvalidationPaths("/creative-drafts/draft-1/analysis")).toEqual(["/api/v1/creative-drafts/latest"]);
   });
 
   it("refreshes both collections and the current book after book mutations", () => {

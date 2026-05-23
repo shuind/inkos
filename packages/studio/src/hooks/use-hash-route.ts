@@ -5,6 +5,7 @@ export type HashRoute =
   | { page: "chat" }
   | { page: "book"; bookId: string }
   | { page: "book-settings"; bookId: string }
+  | { page: "workbench"; bookId: string }
   | { page: "book-create" }
   | { page: "services" }
   | { page: "service-detail"; serviceId: string }
@@ -33,6 +34,9 @@ function parseHash(hash: string): HashRoute {
   const bookSettingsMatch = path.match(/^book\/([^/]+)\/settings$/);
   if (bookSettingsMatch) return { page: "book-settings", bookId: decodeURIComponent(bookSettingsMatch[1]) };
 
+  const workbenchMatch = path.match(/^book\/([^/]+)\/workbench$/);
+  if (workbenchMatch) return { page: "workbench", bookId: decodeURIComponent(workbenchMatch[1]) };
+
   const bookMatch = path.match(/^book\/([^/]+)$/);
   if (bookMatch) return { page: "book", bookId: decodeURIComponent(bookMatch[1]) };
 
@@ -45,6 +49,7 @@ function routeToHash(route: HashRoute): string {
     case "chat": return "#/chat";
     case "book": return `#/book/${encodeURIComponent(route.bookId)}`;
     case "book-settings": return `#/book/${encodeURIComponent(route.bookId)}/settings`;
+    case "workbench": return `#/book/${encodeURIComponent(route.bookId)}/workbench`;
     case "book-create": return "#/book/new";
     case "services": return "#/services";
     case "service-detail": return `#/services/${encodeURIComponent(route.serviceId)}`;
@@ -54,7 +59,7 @@ function routeToHash(route: HashRoute): string {
 
 export { parseHash, routeToHash }; // for testing
 
-const HASH_PAGES = new Set(["dashboard", "chat", "book", "book-settings", "book-create", "services", "service-detail"]);
+const HASH_PAGES = new Set(["dashboard", "chat", "book", "book-settings", "workbench", "book-create", "services", "service-detail"]);
 
 export function useHashRoute() {
   const [route, setRouteState] = useState<HashRoute>(() => parseHash(window.location.hash));

@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { streamSSE } from "hono/streaming";
 import { serve } from "@hono/node-server";
 import {
+  type BookConfig,
   StateManager,
   PipelineRunner,
   createLLMClient,
@@ -51,7 +52,55 @@ import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promise
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { isSafeBookId } from "./safety.js";
 import { ApiError } from "./errors.js";
-import { buildStudioBookConfig } from "./book-create.js";
+import { buildStudioBookConfig, type StudioCreateBookBody } from "./book-create.js";
+import {
+  WorkbenchError,
+  applyWorkbenchAction,
+  archiveWorkbenchEntry,
+  appendWorkbenchAdvisorAssistantMessage,
+  buildAdvisorContextRefs,
+  buildWorkbenchConsensusSnapshot,
+  buildWorkbenchChapterPrompt,
+  buildWorkbenchAdvisorActionPlanMessages,
+  buildWorkbenchAdvisorMessages,
+  buildWorkbenchOrganizeMessages,
+  createWorkbenchEntryFromAdvisorPlan,
+  createWorkbenchPaste,
+  listWorkbenchEntries,
+  loadLatestWorkbenchAdvisorThread,
+  loadWorkbenchEntry,
+  parseWorkbenchAdvisorActionPlanResponse,
+  parseWorkbenchActionPlanResponse,
+  parseWorkbenchDigestResponse,
+  saveWorkbenchSelection,
+  saveWorkbenchAdvisorUserMessage,
+  updateWorkbenchEntryActionPlan,
+  updateWorkbenchEntryDigest,
+  type WorkbenchBlockKind,
+  type WorkbenchSaveTarget,
+} from "./workbench.js";
+import {
+  CreativeDraftError,
+  buildCreativeDraftAnalyzeMessages,
+  buildCreativeDraftAnalyzeMessagesV2,
+  defaultFirstVolumeStartup,
+  loadCreativeDraft,
+  loadLatestCreativeDraft,
+  markCreativeDraftCreated,
+  parseCreativeDraftAnalysisResponse,
+  renderCreativeDraftBookRules,
+  renderCreativeDraftCurrentState,
+  renderCreativeDraftPendingHooks,
+  renderCreativeDraftStartupMarkdown,
+  renderCreativeDraftStoryFrame,
+  renderCreativeDraftVolumeMap,
+  saveCreativeDraft,
+  updateCreativeDraftSnapshot,
+  updateCreativeDraftAnalysis,
+  type CreativeDraft,
+  type CreativeDraftAnalysis,
+  type FirstVolumeStartup,
+} from "./creative-drafts.js";
 
 // -- Pipeline stage definitions per agent type --
 
@@ -496,6 +545,30 @@ interface StudioBookListSummary {
   readonly [key: string]: unknown;
 }
 
+interface CreativeGuideFieldInput {
+  readonly key?: string;
+  readonly label?: string;
+  readonly value?: string;
+}
+
+interface CreativeGuideCheckpointInput {
+  readonly label?: string;
+  readonly problem?: string;
+  readonly solution?: string;
+  readonly reversal?: string;
+}
+
+interface WorkbenchCreateBookBody extends StudioCreateBookBody {
+  readonly guideFields?: ReadonlyArray<CreativeGuideFieldInput>;
+  readonly checkpoints?: ReadonlyArray<CreativeGuideCheckpointInput>;
+  readonly pasteText?: string;
+}
+
+interface CreativeDraftCreateBookBody {
+  readonly startup?: FirstVolumeStartup;
+  readonly candidates?: ReadonlyArray<unknown>;
+}
+
 // --- Event bus for SSE ---
 
 type EventHandler = (event: string, data: unknown) => void;
@@ -590,6 +663,599 @@ async function loadStudioBookListSummary(
   const book = await state.loadBookConfig(bookId);
   const nextChapter = await state.getNextChapterNumber(bookId);
   return { ...book, chaptersWritten: nextChapter - 1 };
+}
+
+function trimToLimit(value: unknown, limit: number): string {
+  return typeof value === "string" ? value.trim().slice(0, limit) : "";
+}
+
+function parsePositiveIntOrDefault(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number"
+    ? value
+    : typeof value === "string"
+      ? Number.parseInt(value, 10)
+      : Number.NaN;
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeGuideFields(fields: unknown): Array<{ key: string; label: string; value: string }> {
+  if (!Array.isArray(fields)) {
+    return [];
+  }
+  return fields
+    .map((field): { key: string; label: string; value: string } | null => {
+      if (!field || typeof field !== "object") {
+        return null;
+      }
+      const source = field as CreativeGuideFieldInput;
+      const key = trimToLimit(source.key, 80);
+      const label = trimToLimit(source.label, 80);
+      const value = trimToLimit(source.value, 4_000);
+      if (!key && !label && !value) {
+        return null;
+      }
+      return {
+        key: key || label || "field",
+        label: label || key || "字段",
+        value,
+      };
+    })
+    .filter((field): field is { key: string; label: string; value: string } => field !== null);
+}
+
+function normalizeGuideCheckpoints(checkpoints: unknown): Array<{
+  label: string;
+  problem: string;
+  solution: string;
+  reversal: string;
+}> {
+  if (!Array.isArray(checkpoints)) {
+    return [];
+  }
+  return checkpoints
+    .map((checkpoint): { label: string; problem: string; solution: string; reversal: string } | null => {
+      if (!checkpoint || typeof checkpoint !== "object") {
+        return null;
+      }
+      const source = checkpoint as CreativeGuideCheckpointInput;
+      const label = trimToLimit(source.label, 80);
+      const problem = trimToLimit(source.problem, 2_000);
+      const solution = trimToLimit(source.solution, 2_000);
+      const reversal = trimToLimit(source.reversal, 2_000);
+      if (!label && !problem && !solution && !reversal) {
+        return null;
+      }
+      return {
+        label: label || "关卡",
+        problem,
+        solution,
+        reversal,
+      };
+    })
+    .filter((checkpoint): checkpoint is { label: string; problem: string; solution: string; reversal: string } => checkpoint !== null);
+}
+
+function fieldValue(
+  fields: ReadonlyArray<{ readonly key: string; readonly value: string }>,
+  key: string,
+): string {
+  return fields.find((field) => field.key === key)?.value ?? "";
+}
+
+function markdownOrTodo(value: string, fallback = "待补充"): string {
+  return value.trim() || fallback;
+}
+
+const PLATFORM_LABELS: Record<string, string> = {
+  tomato: "番茄小说",
+  qidian: "起点中文网",
+  feilu: "飞卢",
+  "royal-road": "Royal Road",
+  "kindle-unlimited": "Kindle Unlimited",
+  "scribble-hub": "Scribble Hub",
+  other: "其他",
+};
+
+function platformDisplayName(platform: string | undefined): string {
+  const value = platform?.trim() ?? "";
+  return (PLATFORM_LABELS[value] ?? value) || "其他";
+}
+
+function renderGuideFieldsMarkdown(fields: ReadonlyArray<{ readonly label: string; readonly value: string }>): string {
+  if (!fields.length) {
+    return "暂无结构化字段。\n";
+  }
+  return fields
+    .map((field) => `## ${field.label}\n\n${markdownOrTodo(field.value)}\n`)
+    .join("\n");
+}
+
+function renderGuideCheckpointsMarkdown(checkpoints: ReadonlyArray<{
+  readonly label: string;
+  readonly problem: string;
+  readonly solution: string;
+  readonly reversal: string;
+}>): string {
+  if (!checkpoints.length) {
+    return "暂无关卡设计。\n";
+  }
+  return checkpoints
+    .map((checkpoint) => [
+      `## ${checkpoint.label}`,
+      "",
+      `- 难题：${markdownOrTodo(checkpoint.problem)}`,
+      `- 解法：${markdownOrTodo(checkpoint.solution)}`,
+      `- 反转/升级：${markdownOrTodo(checkpoint.reversal)}`,
+      "",
+    ].join("\n"))
+    .join("\n");
+}
+
+function renderCreationGuideMarkdown(params: {
+  readonly book: BookConfig;
+  readonly blurb: string;
+  readonly fields: ReadonlyArray<{ readonly label: string; readonly value: string }>;
+  readonly checkpoints: ReadonlyArray<{
+    readonly label: string;
+    readonly problem: string;
+    readonly solution: string;
+    readonly reversal: string;
+  }>;
+  readonly pasteText: string;
+  readonly createdAt: string;
+}): string {
+  return [
+    `# ${params.book.title} 创作启动稿`,
+    "",
+    `创建时间：${params.createdAt}`,
+    "",
+    "## 基础信息",
+    "",
+    `- 题材：${params.book.genre}`,
+    `- 平台：${platformDisplayName(params.book.platform)}`,
+    `- 目标章节：${params.book.targetChapters}`,
+    `- 每章字数：${params.book.chapterWordCount}`,
+    "",
+    "## 一句话/简介",
+    "",
+    markdownOrTodo(params.blurb),
+    "",
+    "# 创作指南字段",
+    "",
+    renderGuideFieldsMarkdown(params.fields).trimEnd(),
+    "",
+    "# 难题链",
+    "",
+    renderGuideCheckpointsMarkdown(params.checkpoints).trimEnd(),
+    "",
+    "# 外部构思粘贴",
+    "",
+    params.pasteText.trim() || "暂无。",
+    "",
+  ].join("\n");
+}
+
+function renderStoryFrameMarkdown(params: {
+  readonly book: BookConfig;
+  readonly blurb: string;
+  readonly fields: ReadonlyArray<{ readonly key: string; readonly label: string; readonly value: string }>;
+  readonly checkpoints: ReadonlyArray<{
+    readonly label: string;
+    readonly problem: string;
+    readonly solution: string;
+    readonly reversal: string;
+  }>;
+}): string {
+  return [
+    `# ${params.book.title} 故事框架`,
+    "",
+    "## 故事核心",
+    "",
+    markdownOrTodo(fieldValue(params.fields, "logline") || params.blurb),
+    "",
+    "## 五问构思法",
+    "",
+    `- 主人公是谁：${markdownOrTodo(fieldValue(params.fields, "protagonist"))}`,
+    `- 主人公要做什么：${markdownOrTodo(fieldValue(params.fields, "goal"))}`,
+    `- 为什么非做不可：${markdownOrTodo(fieldValue(params.fields, "stakes"))}`,
+    `- 准备怎么做：${markdownOrTodo(fieldValue(params.fields, "method"))}`,
+    `- 结果/代价是什么：${markdownOrTodo(fieldValue(params.fields, "ending"))}`,
+    "",
+    "## 核心阻力",
+    "",
+    markdownOrTodo(fieldValue(params.fields, "opposition")),
+    "",
+    "## 难题链",
+    "",
+    renderGuideCheckpointsMarkdown(params.checkpoints).trimEnd(),
+    "",
+  ].join("\n");
+}
+
+function renderVolumeMapMarkdown(params: {
+  readonly fields: ReadonlyArray<{ readonly key: string; readonly value: string }>;
+  readonly checkpoints: ReadonlyArray<{ readonly label: string; readonly problem: string; readonly solution: string; readonly reversal: string }>;
+}): string {
+  return [
+    "# 卷纲 / 阶段推进",
+    "",
+    "## 开头切入点",
+    "",
+    markdownOrTodo(fieldValue(params.fields, "opening")),
+    "",
+    "## 第一段变化点",
+    "",
+    markdownOrTodo(fieldValue(params.fields, "firstTurn")),
+    "",
+    "## 阶段关卡",
+    "",
+    renderGuideCheckpointsMarkdown(params.checkpoints).trimEnd(),
+    "",
+    "## 最终决战",
+    "",
+    markdownOrTodo(fieldValue(params.fields, "finalBattle")),
+    "",
+  ].join("\n");
+}
+
+function renderBookRulesMarkdown(params: {
+  readonly fields: ReadonlyArray<{ readonly key: string; readonly value: string }>;
+}): string {
+  return [
+    "# 创作规则",
+    "",
+    "## 主角呈现",
+    "",
+    `- 讨喜点：${markdownOrTodo(fieldValue(params.fields, "likeability"))}`,
+    `- 说话方式：${markdownOrTodo(fieldValue(params.fields, "voice"))}`,
+    "",
+    "## 对话规则",
+    "",
+    "每场关键对话都应带有立场差异、信息差或利益冲突，避免纯解释。",
+    "",
+    "## 悬念规则",
+    "",
+    markdownOrTodo(fieldValue(params.fields, "suspense"), "每一阶段保留至少一个未解问题，并让答案牵出更大的问题。"),
+    "",
+    "## 工作流规则",
+    "",
+    "Gemini 官网输出先进入创作工作台，人工确认后再保存为设定、提示词、素材、版本或章节。",
+    "",
+  ].join("\n");
+}
+
+function renderAuthorIntentMarkdown(params: {
+  readonly book: BookConfig;
+  readonly blurb: string;
+  readonly fields: ReadonlyArray<{ readonly key: string; readonly value: string }>;
+}): string {
+  return [
+    "# 作者意图",
+    "",
+    `这本书当前处于人工构思/外部 Gemini 协作阶段。目标是先把 ${params.book.title} 的故事骨架、人物动机、难题链和悬念层整理清楚，再进入章节写作。`,
+    "",
+    "## 核心方向",
+    "",
+    markdownOrTodo(fieldValue(params.fields, "logline") || params.blurb),
+    "",
+    "## 最高优先级",
+    "",
+    "- 保留人工主导权，所有外部输出都需要进入工作台确认。",
+    "- 优先解决主人公、目标、动机、阻力、难题链和开头切入点。",
+    "- 不急于自动写长篇正文，先让设定稳定。",
+    "",
+  ].join("\n");
+}
+
+function renderCurrentFocusMarkdown(): string {
+  return [
+    "# 当前聚焦",
+    "",
+    "## 下一步",
+    "",
+    "1. 在创作工作台粘贴 Gemini 官网的构思或正文输出。",
+    "2. 拆分后人工确认，保存为设定、素材、提示词或章节。",
+    "3. 补齐创作指南字段，特别是五问构思法、难题链、悬念和开头切入点。",
+    "",
+  ].join("\n");
+}
+
+function renderCurrentStateMarkdown(params: {
+  readonly book: BookConfig;
+  readonly fields: ReadonlyArray<{ readonly key: string; readonly value: string }>;
+}): string {
+  return [
+    "# 当前状态",
+    "",
+    `作品：${params.book.title}`,
+    "",
+    "## 已知事实",
+    "",
+    `- 主人公：${markdownOrTodo(fieldValue(params.fields, "protagonist"))}`,
+    `- 目标：${markdownOrTodo(fieldValue(params.fields, "goal"))}`,
+    `- 动机/压力：${markdownOrTodo(fieldValue(params.fields, "stakes"))}`,
+    `- 最大阻力：${markdownOrTodo(fieldValue(params.fields, "opposition"))}`,
+    "",
+    "## 章节进度",
+    "",
+    "尚未写入正式章节。",
+    "",
+  ].join("\n");
+}
+
+function renderPendingHooksMarkdown(params: {
+  readonly fields: ReadonlyArray<{ readonly key: string; readonly value: string }>;
+}): string {
+  return [
+    "# 待回收悬念",
+    "",
+    `- ${markdownOrTodo(fieldValue(params.fields, "suspense"), "待设计超级悬念。")}`,
+    "",
+  ].join("\n");
+}
+
+async function createWorkbenchBookSkeleton(params: {
+  readonly state: StateManager;
+  readonly body: WorkbenchCreateBookBody;
+  readonly now: string;
+}): Promise<BookConfig> {
+  const title = trimToLimit(params.body.title, 120);
+  if (!title) {
+    throw new ApiError(400, "TITLE_REQUIRED", "title is required");
+  }
+  const genre = trimToLimit(params.body.genre, 80) || "other";
+  const bookConfigDraft = buildStudioBookConfig({
+    title,
+    genre,
+    language: params.body.language,
+    platform: params.body.platform,
+    targetChapters: parsePositiveIntOrDefault(params.body.targetChapters, 200),
+    chapterWordCount: parsePositiveIntOrDefault(params.body.chapterWordCount, 3000),
+    blurb: trimToLimit(params.body.blurb, 4_000),
+  }, params.now);
+  const book: BookConfig = {
+    ...bookConfigDraft,
+    status: "incubating",
+  };
+  if (!book.id || !isSafeBookId(book.id)) {
+    throw new ApiError(400, "INVALID_BOOK_ID", "title cannot produce a safe book id");
+  }
+
+  const bookDir = params.state.bookDir(book.id);
+  try {
+    await access(join(bookDir, "book.json"));
+    throw new ApiError(409, "BOOK_EXISTS", `Book "${book.id}" already exists`);
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+  }
+
+  const fields = normalizeGuideFields(params.body.guideFields);
+  const checkpoints = normalizeGuideCheckpoints(params.body.checkpoints);
+  const blurb = trimToLimit(params.body.blurb, 4_000);
+  const pasteText = trimToLimit(params.body.pasteText, 80_000);
+
+  await Promise.all([
+    mkdir(join(bookDir, "story", "outline"), { recursive: true }),
+    mkdir(join(bookDir, "story", "roles", "主要角色"), { recursive: true }),
+    mkdir(join(bookDir, "story", "roles", "次要角色"), { recursive: true }),
+    mkdir(join(bookDir, "story", "runtime"), { recursive: true }),
+    mkdir(join(bookDir, "story", "state"), { recursive: true }),
+    mkdir(join(bookDir, "chapters"), { recursive: true }),
+    mkdir(join(bookDir, "workspace", "materials"), { recursive: true }),
+    mkdir(join(bookDir, "inbox"), { recursive: true }),
+    mkdir(join(bookDir, "notes"), { recursive: true }),
+    mkdir(join(bookDir, "prompts"), { recursive: true }),
+    mkdir(join(bookDir, "versions"), { recursive: true }),
+  ]);
+
+  const creationGuide = renderCreationGuideMarkdown({
+    book,
+    blurb,
+    fields,
+    checkpoints,
+    pasteText,
+    createdAt: params.now,
+  });
+  const storyFrame = renderStoryFrameMarkdown({ book, blurb, fields, checkpoints });
+  const volumeMap = renderVolumeMapMarkdown({ fields, checkpoints });
+  const bookRules = renderBookRulesMarkdown({ fields });
+
+  await Promise.all([
+    writeFile(join(bookDir, "book.json"), JSON.stringify(book, null, 2), "utf-8"),
+    writeFile(join(bookDir, "chapters", "index.json"), "[]\n", "utf-8"),
+    writeFile(join(bookDir, "workspace", "creation-guide.md"), creationGuide, "utf-8"),
+    writeFile(join(bookDir, "workspace", "materials", "creation-guide.json"), JSON.stringify({
+      createdAt: params.now,
+      fields,
+      checkpoints,
+      hasPasteText: Boolean(pasteText),
+    }, null, 2), "utf-8"),
+    writeFile(join(bookDir, "story", "author_intent.md"), renderAuthorIntentMarkdown({ book, blurb, fields }), "utf-8"),
+    writeFile(join(bookDir, "story", "current_focus.md"), renderCurrentFocusMarkdown(), "utf-8"),
+    writeFile(join(bookDir, "story", "current_state.md"), renderCurrentStateMarkdown({ book, fields }), "utf-8"),
+    writeFile(join(bookDir, "story", "pending_hooks.md"), renderPendingHooksMarkdown({ fields }), "utf-8"),
+    writeFile(join(bookDir, "story", "book_rules.md"), bookRules, "utf-8"),
+    writeFile(join(bookDir, "story", "story_bible.md"), storyFrame, "utf-8"),
+    writeFile(join(bookDir, "story", "volume_outline.md"), volumeMap, "utf-8"),
+    writeFile(join(bookDir, "story", "outline", "story_frame.md"), storyFrame, "utf-8"),
+    writeFile(join(bookDir, "story", "outline", "volume_map.md"), volumeMap, "utf-8"),
+    writeFile(join(bookDir, "story", "chapter_summaries.md"), "# 章节摘要\n\n暂无正式章节。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "character_matrix.md"), "# 人物矩阵\n\n待从工作台整理。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "subplot_board.md"), "# 支线板\n\n待从工作台整理。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "emotional_arcs.md"), "# 情绪弧线\n\n待从工作台整理。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "particle_ledger.md"), "# 粒子账本\n\n暂无。\n", "utf-8"),
+  ]);
+
+  if (pasteText) {
+    await createWorkbenchPaste({
+      state: params.state,
+      bookId: book.id,
+      text: pasteText,
+      sourceName: "建书粘贴",
+      now: new Date(params.now),
+    });
+  }
+
+  return book;
+}
+
+async function createBookFromCreativeDraft(params: {
+  readonly state: StateManager;
+  readonly draft: CreativeDraft;
+  readonly startup: FirstVolumeStartup;
+  readonly candidates: CreativeDraftAnalysis["candidates"];
+  readonly now: string;
+}): Promise<BookConfig> {
+  const startup = defaultFirstVolumeStartup();
+  const mergedStartup: FirstVolumeStartup = {
+    ...startup,
+    ...params.startup,
+    book: {
+      ...startup.book,
+      ...params.startup.book,
+      title: trimToLimit(params.startup.book.title, 120) || startup.book.title,
+      genre: trimToLimit(params.startup.book.genre, 80) || "待定",
+      platform: trimToLimit(params.startup.book.platform, 40) || "other",
+      targetChapters: parsePositiveIntOrDefault(params.startup.book.targetChapters, 200),
+      chapterWordCount: parsePositiveIntOrDefault(params.startup.book.chapterWordCount, 3000),
+      blurb: trimToLimit(params.startup.book.blurb, 4_000),
+    },
+    stable: { ...startup.stable, ...params.startup.stable },
+    volume1: { ...startup.volume1, ...params.startup.volume1 },
+    chapters: params.startup.chapters,
+    followups: { ...startup.followups, ...params.startup.followups },
+  };
+
+  const bookConfigDraft = buildStudioBookConfig({
+    title: mergedStartup.book.title,
+    genre: mergedStartup.book.genre || "待定",
+    language: "zh",
+    platform: mergedStartup.book.platform,
+    targetChapters: mergedStartup.book.targetChapters,
+    chapterWordCount: mergedStartup.book.chapterWordCount,
+    blurb: mergedStartup.book.blurb,
+  }, params.now);
+  const book: BookConfig = {
+    ...bookConfigDraft,
+    status: "incubating",
+  };
+  if (!book.id || !isSafeBookId(book.id)) {
+    throw new ApiError(400, "INVALID_BOOK_ID", "title cannot produce a safe book id");
+  }
+
+  const bookDir = params.state.bookDir(book.id);
+  try {
+    await access(join(bookDir, "book.json"));
+    throw new ApiError(409, "BOOK_EXISTS", `Book "${book.id}" already exists`);
+  } catch (error) {
+    if (error instanceof ApiError) {
+      throw error;
+    }
+  }
+
+  await Promise.all([
+    mkdir(join(bookDir, "story", "outline"), { recursive: true }),
+    mkdir(join(bookDir, "story", "roles", "主要角色"), { recursive: true }),
+    mkdir(join(bookDir, "story", "roles", "次要角色"), { recursive: true }),
+    mkdir(join(bookDir, "story", "runtime"), { recursive: true }),
+    mkdir(join(bookDir, "story", "state"), { recursive: true }),
+    mkdir(join(bookDir, "chapters"), { recursive: true }),
+    mkdir(join(bookDir, "workspace", "materials"), { recursive: true }),
+    mkdir(join(bookDir, "inbox"), { recursive: true }),
+    mkdir(join(bookDir, "notes"), { recursive: true }),
+    mkdir(join(bookDir, "prompts"), { recursive: true }),
+    mkdir(join(bookDir, "versions"), { recursive: true }),
+  ]);
+
+  const storyFrame = renderCreativeDraftStoryFrame({ book, startup: mergedStartup, candidates: params.candidates });
+  const volumeMap = renderCreativeDraftVolumeMap(mergedStartup);
+  const startupMarkdown = renderCreativeDraftStartupMarkdown(mergedStartup);
+  const analysisJson = JSON.stringify({
+    draftId: params.draft.id,
+    createdAt: params.now,
+    candidates: params.candidates,
+    startup: mergedStartup,
+  }, null, 2);
+
+  await Promise.all([
+    writeFile(join(bookDir, "book.json"), JSON.stringify(book, null, 2), "utf-8"),
+    writeFile(join(bookDir, "chapters", "index.json"), "[]\n", "utf-8"),
+    writeFile(join(bookDir, "workspace", "creation-guide.md"), startupMarkdown, "utf-8"),
+    writeFile(join(bookDir, "workspace", "materials", "creative-draft-analysis.json"), `${analysisJson}\n`, "utf-8"),
+    writeFile(join(bookDir, "story", "author_intent.md"), [
+      "# 作者意图",
+      "",
+      "这本书从 Gemini 官网粘贴内容进入 Studio，经 DeepSeek 整理和人工确认后创建。",
+      "",
+      "## 第一卷优先级",
+      "",
+      `- 第一卷核心：${markdownOrTodo(mergedStartup.volume1.coreHook)}`,
+      `- 开头切入：${markdownOrTodo(mergedStartup.volume1.opening)}`,
+      `- 阶段目标：${markdownOrTodo(mergedStartup.volume1.goal)}`,
+      "",
+    ].join("\n"), "utf-8"),
+    writeFile(join(bookDir, "story", "current_focus.md"), [
+      "# 当前聚焦",
+      "",
+      "## 下一步",
+      "",
+      "1. 继续在创作工作台粘贴 Gemini 官网的新构思或正文。",
+      "2. 按第一卷近 10 章问题链推进章节设计。",
+      "3. 每次保存前人工确认候选内容，不把 AI 建议自动当成事实。",
+      "",
+    ].join("\n"), "utf-8"),
+    writeFile(join(bookDir, "story", "current_state.md"), renderCreativeDraftCurrentState(book, mergedStartup), "utf-8"),
+    writeFile(join(bookDir, "story", "pending_hooks.md"), renderCreativeDraftPendingHooks(mergedStartup), "utf-8"),
+    writeFile(join(bookDir, "story", "book_rules.md"), renderCreativeDraftBookRules(mergedStartup), "utf-8"),
+    writeFile(join(bookDir, "story", "story_bible.md"), storyFrame, "utf-8"),
+    writeFile(join(bookDir, "story", "volume_outline.md"), volumeMap, "utf-8"),
+    writeFile(join(bookDir, "story", "outline", "story_frame.md"), storyFrame, "utf-8"),
+    writeFile(join(bookDir, "story", "outline", "volume_map.md"), volumeMap, "utf-8"),
+    writeFile(join(bookDir, "story", "chapter_summaries.md"), "# 章节摘要\n\n暂无正式章节。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "character_matrix.md"), "# 人物矩阵\n\n待从工作台整理。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "subplot_board.md"), "# 支线板\n\n待从工作台整理。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "emotional_arcs.md"), "# 情绪弧线\n\n待从工作台整理。\n", "utf-8"),
+    writeFile(join(bookDir, "story", "particle_ledger.md"), "# 粒子账本\n\n暂无。\n", "utf-8"),
+  ]);
+
+  await createWorkbenchPaste({
+    state: params.state,
+    bookId: book.id,
+    text: params.draft.text,
+    sourceName: params.draft.sourceName,
+    now: new Date(params.now),
+  });
+
+  await createWorkbenchPaste({
+    state: params.state,
+    bookId: book.id,
+    text: [
+      "# 建书前整理结果",
+      "",
+      startupMarkdown,
+      "",
+      "# 候选审核",
+      "",
+      params.candidates.length
+        ? params.candidates.map((candidate) => [
+          `## ${candidate.label}`,
+          "",
+          `- 类型：${candidate.kind}`,
+          `- 状态：${candidate.status}`,
+          `- 位置：${candidate.targetPath}`,
+          `- 内容：${candidate.value || "暂无"}`,
+          `- 证据：${candidate.evidence || "暂无"}`,
+          "",
+        ].join("\n")).join("\n")
+        : "暂无候选。",
+    ].join("\n"),
+    sourceName: "建书前整理",
+    now: new Date(params.now),
+  });
+
+  return book;
 }
 
 function isCustomServiceId(serviceId: string): boolean {
@@ -1354,6 +2020,141 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
 
   // --- Book Create ---
 
+  app.get("/api/v1/creative-drafts/latest", async (c) => {
+    const draft = await loadLatestCreativeDraft(root);
+    return c.json({ draft });
+  });
+
+  app.post("/api/v1/creative-drafts", async (c) => {
+    const body = await c.req
+      .json<{ draftId?: string; sourceName?: string; text?: string }>()
+      .catch((): { draftId?: string; sourceName?: string; text?: string } => ({}));
+    try {
+      const draft = await saveCreativeDraft({
+        root,
+        draftId: body.draftId,
+        sourceName: body.sourceName,
+        text: body.text,
+      });
+      return c.json({ draft });
+    } catch (e) {
+      if (e instanceof CreativeDraftError) {
+        return c.json({ error: { code: e.code, message: e.message } }, e.status as 400 | 404 | 500);
+      }
+      throw e;
+    }
+  });
+
+  app.post("/api/v1/creative-drafts/:id/analyze", async (c) => {
+    const draftId = c.req.param("id");
+    try {
+      const draft = await saveCreativeDraft({
+        root,
+        draftId,
+        ...(await c.req.json<{ sourceName?: string; text?: string }>().catch(() => ({}))),
+      }).catch(async (error) => {
+        if (error instanceof CreativeDraftError && error.code === "TEXT_REQUIRED") {
+          return loadLatestCreativeDraft(root).then((latest) => {
+            if (latest?.id === draftId) return latest;
+            throw error;
+          });
+        }
+        throw error;
+      });
+      const config = await loadCurrentProjectConfig();
+      const llm = config.llm as ProjectConfig["llm"] & { readonly defaultModel?: string };
+      const model = trimToLimit(llm.model, 120) || trimToLimit(llm.defaultModel, 120);
+      if (!model) {
+        throw new ApiError(400, "LLM_MODEL_REQUIRED", "请先在模型配置中选择 DeepSeek/defaultModel。");
+      }
+      const client = createLLMClient({ ...llm, model });
+      const response = await chatCompletion(client, model, buildCreativeDraftAnalyzeMessagesV2(draft), {
+        temperature: 0.2,
+        maxTokens: 4096,
+      });
+      const analysis = parseCreativeDraftAnalysisResponse({
+        responseText: response.content,
+        model,
+      });
+      const updated = await updateCreativeDraftAnalysis({
+        root,
+        draftId: draft.id,
+        analysis,
+      });
+      return c.json({ draft: updated, analysis: updated.analysis });
+    } catch (e) {
+      if (e instanceof CreativeDraftError) {
+        return c.json({ error: { code: e.code, message: e.message } }, e.status as 400 | 404 | 502);
+      }
+      throw e;
+    }
+  });
+
+  app.put("/api/v1/creative-drafts/:id/analysis", async (c) => {
+    const draftId = c.req.param("id");
+    const body = await c.req.json<unknown>().catch(() => ({}));
+    try {
+      const record = body && typeof body === "object" && !Array.isArray(body) ? body as { analysis?: unknown } : {};
+      const draft = await updateCreativeDraftSnapshot({
+        root,
+        draftId,
+        snapshot: record.analysis ?? body,
+      });
+      return c.json({ draft, analysis: draft.analysis, snapshot: draft.snapshot });
+    } catch (e) {
+      if (e instanceof CreativeDraftError) {
+        return c.json({ error: { code: e.code, message: e.message } }, e.status as 400 | 404 | 500);
+      }
+      throw e;
+    }
+  });
+
+  app.post("/api/v1/creative-drafts/:id/create-book", async (c) => {
+    const draftId = c.req.param("id");
+    const body = await c.req
+      .json<CreativeDraftCreateBookBody>()
+      .catch((): CreativeDraftCreateBookBody => ({}));
+    try {
+      let draft = await loadLatestCreativeDraft(root);
+      if (draft?.id !== draftId) {
+        draft = null;
+      }
+      draft ??= await loadCreativeDraft(root, draftId);
+      const baseAnalysis = draft.snapshot ?? draft.analysis ?? {
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        candidates: [],
+        startup: defaultFirstVolumeStartup(),
+      };
+      const analysisDraft = await updateCreativeDraftSnapshot({
+        root,
+        draftId: draft.id,
+        snapshot: {
+          ...baseAnalysis,
+          ...(body.startup ? { startup: body.startup } : {}),
+          ...(body.candidates ? { candidates: body.candidates } : {}),
+        },
+      });
+      const analysis = analysisDraft.analysis!;
+      const book = await createBookFromCreativeDraft({
+        state,
+        draft: analysisDraft,
+        startup: analysis.startup,
+        candidates: analysis.candidates,
+        now: new Date().toISOString(),
+      });
+      await markCreativeDraftCreated({ root, draftId: draft.id, bookId: book.id });
+      const summary: StudioBookListSummary = { ...book, chaptersWritten: 0 };
+      broadcast("book:created", { bookId: book.id, book: summary });
+      return c.json({ ok: true, bookId: book.id, book: summary });
+    } catch (e) {
+      if (e instanceof CreativeDraftError) {
+        return c.json({ error: { code: e.code, message: e.message } }, e.status as 400 | 404 | 500);
+      }
+      throw e;
+    }
+  });
+
   app.post("/api/v1/books/create", async (c) => {
     const body = await c.req.json<{
       title: string;
@@ -1416,6 +2217,20 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     return c.json({ status: "creating", bookId });
   });
 
+  app.post("/api/v1/books/workbench-create", async (c) => {
+    const body = await c.req
+      .json<WorkbenchCreateBookBody>()
+      .catch((): WorkbenchCreateBookBody => ({ title: "", genre: "" }));
+    const book = await createWorkbenchBookSkeleton({
+      state,
+      body,
+      now: new Date().toISOString(),
+    });
+    const summary: StudioBookListSummary = { ...book, chaptersWritten: 0 };
+    broadcast("book:created", { bookId: book.id, book: summary });
+    return c.json({ ok: true, bookId: book.id, book: summary });
+  });
+
   app.get("/api/v1/books/:id/create-status", async (c) => {
     const id = c.req.param("id");
     const status = bookCreateStatus.get(id);
@@ -1464,6 +2279,363 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       await writeFileFs(join(chaptersDir, match), content, "utf-8");
       return c.json({ ok: true, chapterNumber: num });
     } catch (e) {
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  // --- Creative workbench ---
+
+  app.get("/api/v1/books/:id/workbench", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const entries = await listWorkbenchEntries({ state, bookId: id });
+      return c.json({ entries });
+    } catch (e) {
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.get("/api/v1/books/:id/workbench/:entryId", async (c) => {
+    const id = c.req.param("id");
+    const entryId = c.req.param("entryId");
+    try {
+      const entry = await loadWorkbenchEntry({ state, bookId: id, entryId });
+      return c.json({ entry });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/paste", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req
+      .json<{ text?: string; sourceName?: string }>()
+      .catch((): { text?: string; sourceName?: string } => ({}));
+    try {
+      const entry = await createWorkbenchPaste({
+        state,
+        bookId: id,
+        text: body.text ?? "",
+        sourceName: body.sourceName,
+      });
+      return c.json({ entry });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/chapter-prompt", async (c) => {
+    const id = c.req.param("id");
+    type ChapterPromptBody = {
+      readonly chapterNumber?: number;
+      readonly draftTitle?: string;
+      readonly draftContent?: string;
+      readonly instruction?: string;
+    };
+    const body = await c.req
+      .json<ChapterPromptBody>()
+      .catch((): ChapterPromptBody => ({}));
+    try {
+      const prompt = await buildWorkbenchChapterPrompt({
+        state,
+        bookId: id,
+        chapterNumber: body.chapterNumber,
+        draftTitle: body.draftTitle,
+        draftContent: body.draftContent,
+        instruction: body.instruction,
+      });
+      return c.json(prompt);
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.get("/api/v1/books/:id/workbench/advisor/latest", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const thread = await loadLatestWorkbenchAdvisorThread({ state, bookId: id });
+      return c.json({ thread });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/advisor/messages", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req
+      .json<{ threadId?: string; message?: string }>()
+      .catch((): { threadId?: string; message?: string } => ({}));
+    try {
+      const threadWithUserMessage = await saveWorkbenchAdvisorUserMessage({
+        state,
+        bookId: id,
+        threadId: body.threadId,
+        message: body.message ?? "",
+      });
+      const config = await loadCurrentProjectConfig();
+      const llm = config.llm as ProjectConfig["llm"] & { readonly defaultModel?: string };
+      const model = trimToLimit(llm.model, 120) || trimToLimit(llm.defaultModel, 120);
+      if (!model) {
+        throw new ApiError(400, "LLM_MODEL_REQUIRED", "请先在模型配置中选择 DeepSeek/defaultModel。");
+      }
+      const client = createLLMClient({ ...llm, model });
+      const snapshot = await buildWorkbenchConsensusSnapshot({ state, bookId: id });
+      const contextRefs = buildAdvisorContextRefs(snapshot);
+      const response = await chatCompletion(client, model, buildWorkbenchAdvisorMessages({
+        bookId: id,
+        thread: threadWithUserMessage,
+        snapshot,
+      }), {
+        temperature: 0.25,
+        maxTokens: 4096,
+      });
+      const thread = await appendWorkbenchAdvisorAssistantMessage({
+        state,
+        bookId: id,
+        threadId: threadWithUserMessage.id,
+        content: response.content,
+        contextRefs,
+      });
+      return c.json({ thread, message: thread.messages.at(-1), contextRefs });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500 | 502);
+      }
+      if (e instanceof ApiError) {
+        return c.json({ error: { code: e.code, message: e.message } }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/advisor/:threadId/action-plan", async (c) => {
+    const id = c.req.param("id");
+    const threadId = c.req.param("threadId");
+    try {
+      const thread = await loadLatestWorkbenchAdvisorThread({ state, bookId: id });
+      if (!thread || thread.id !== threadId) {
+        throw new WorkbenchError(404, "Workbench advisor thread not found");
+      }
+      const config = await loadCurrentProjectConfig();
+      const llm = config.llm as ProjectConfig["llm"] & { readonly defaultModel?: string };
+      const model = trimToLimit(llm.model, 120) || trimToLimit(llm.defaultModel, 120);
+      if (!model) {
+        throw new ApiError(400, "LLM_MODEL_REQUIRED", "请先在模型配置中选择 DeepSeek/defaultModel。");
+      }
+      const client = createLLMClient({ ...llm, model });
+      const snapshot = await buildWorkbenchConsensusSnapshot({ state, bookId: id });
+      const response = await chatCompletion(client, model, buildWorkbenchAdvisorActionPlanMessages({
+        bookId: id,
+        thread,
+        snapshot,
+      }), {
+        temperature: 0.2,
+        maxTokens: 4096,
+      });
+      const actionPlan = parseWorkbenchAdvisorActionPlanResponse({
+        responseText: response.content,
+        model,
+        thread,
+        targetChapter: snapshot.targetChapter,
+      });
+      const entry = await createWorkbenchEntryFromAdvisorPlan({
+        state,
+        bookId: id,
+        thread,
+        actionPlan,
+      });
+      return c.json({ entry, actionPlan: entry.actionPlan });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500 | 502);
+      }
+      if (e instanceof ApiError) {
+        return c.json({ error: { code: e.code, message: e.message } }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/:entryId/organize", async (c) => {
+    const id = c.req.param("id");
+    const entryId = c.req.param("entryId");
+    try {
+      const entry = await loadWorkbenchEntry({ state, bookId: id, entryId });
+      const config = await loadCurrentProjectConfig();
+      const llm = config.llm as ProjectConfig["llm"] & { readonly defaultModel?: string };
+      const model = trimToLimit(llm.model, 120) || trimToLimit(llm.defaultModel, 120);
+      if (!model) {
+        throw new ApiError(400, "LLM_MODEL_REQUIRED", "请先在模型配置中选择 DeepSeek/defaultModel。");
+      }
+      const client = createLLMClient({ ...llm, model });
+      const snapshot = await buildWorkbenchConsensusSnapshot({ state, bookId: id, entryId });
+      const response = await chatCompletion(client, model, buildWorkbenchOrganizeMessages({ bookId: id, entry, snapshot }), {
+        temperature: 0.2,
+        maxTokens: 4096,
+      });
+      const actionPlan = parseWorkbenchActionPlanResponse({
+        responseText: response.content,
+        model,
+        entry,
+        targetChapter: snapshot.targetChapter,
+      });
+      const updated = await updateWorkbenchEntryActionPlan({
+        state,
+        bookId: id,
+        entryId,
+        actionPlan,
+      });
+      return c.json({ entry: updated, actionPlan: updated.actionPlan, digest: updated.digest });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500 | 502);
+      }
+      if (e instanceof ApiError) {
+        return c.json({ error: { code: e.code, message: e.message } }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.put("/api/v1/books/:id/workbench/:entryId/digest", async (c) => {
+    const id = c.req.param("id");
+    const entryId = c.req.param("entryId");
+    const body = await c.req.json<unknown>().catch(() => ({}));
+    try {
+      const record = body && typeof body === "object" && !Array.isArray(body) ? body as { digest?: unknown } : {};
+      const updated = await updateWorkbenchEntryDigest({
+        state,
+        bookId: id,
+        entryId,
+        digest: record.digest ?? body,
+      });
+      return c.json({ entry: updated, digest: updated.digest });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.put("/api/v1/books/:id/workbench/:entryId/action-plan", async (c) => {
+    const id = c.req.param("id");
+    const entryId = c.req.param("entryId");
+    const body = await c.req.json<unknown>().catch(() => ({}));
+    try {
+      const record = body && typeof body === "object" && !Array.isArray(body) ? body as { actionPlan?: unknown } : {};
+      const updated = await updateWorkbenchEntryActionPlan({
+        state,
+        bookId: id,
+        entryId,
+        actionPlan: record.actionPlan ?? body,
+      });
+      return c.json({ entry: updated, actionPlan: updated.actionPlan });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/:entryId/actions/:actionId/apply", async (c) => {
+    const id = c.req.param("id");
+    const entryId = c.req.param("entryId");
+    const actionId = c.req.param("actionId");
+    type ApplyWorkbenchActionBody = {
+      operation?: "accept" | "reject" | "defer" | "keep_current" | "adopt_new" | "manual";
+      content?: string;
+      targetFile?: string;
+      title?: string;
+      prompt?: string;
+    };
+    const body = await c.req
+      .json<ApplyWorkbenchActionBody>()
+      .catch((): ApplyWorkbenchActionBody => ({}));
+    try {
+      const applied = await applyWorkbenchAction({
+        state,
+        bookId: id,
+        entryId,
+        actionId,
+        operation: body.operation ?? "accept",
+        content: body.content,
+        targetFile: body.targetFile,
+        title: body.title,
+        prompt: body.prompt,
+      });
+      return c.json({
+        ...applied.result,
+        entry: applied.entry,
+        actionPlan: applied.entry.actionPlan,
+      });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/:entryId/archive", async (c) => {
+    const id = c.req.param("id");
+    const entryId = c.req.param("entryId");
+    try {
+      const updated = await archiveWorkbenchEntry({ state, bookId: id, entryId });
+      return c.json({ entry: updated, actionPlan: updated.actionPlan, digest: updated.digest });
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/workbench/save", async (c) => {
+    const id = c.req.param("id");
+    type SaveWorkbenchBody = {
+      readonly target?: WorkbenchSaveTarget;
+      readonly title?: string;
+      readonly content?: string;
+      readonly kind?: WorkbenchBlockKind;
+      readonly sourceEntryId?: string;
+      readonly settingTargetFile?: string;
+      readonly chapterNumber?: number;
+    };
+    const body = await c.req
+      .json<SaveWorkbenchBody>()
+      .catch((): SaveWorkbenchBody => ({}));
+
+    try {
+      const result = await saveWorkbenchSelection({
+        state,
+        bookId: id,
+        target: body.target ?? "note",
+        title: body.title,
+        content: body.content ?? "",
+        kind: body.kind,
+        sourceEntryId: body.sourceEntryId,
+        settingTargetFile: body.settingTargetFile,
+        chapterNumber: body.chapterNumber,
+      });
+      return c.json(result);
+    } catch (e) {
+      if (e instanceof WorkbenchError) {
+        return c.json({ error: e.message }, e.status as 400 | 404 | 500);
+      }
       return c.json({ error: String(e) }, 500);
     }
   });

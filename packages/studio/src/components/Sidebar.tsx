@@ -51,6 +51,7 @@ interface Nav {
   toDashboard: () => void;
   toChat: () => void;
   toBook: (id: string) => void;
+  toWorkbench: (id: string) => void;
   toBookCreate: () => void;
   toServices: () => void;
   toDaemon: () => void;
@@ -336,6 +337,14 @@ export function Sidebar({ nav, activePage, sse, t }: {
                       >
                         <Plus size={12} />
                         <span>新建会话</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => nav.toWorkbench(book.id)}
+                        className="w-full flex items-center gap-2 pl-9 pr-2 py-1.5 text-xs font-medium text-muted-foreground hover:text-primary transition-colors"
+                      >
+                        <FileInput size={12} />
+                        <span>创作工作台</span>
                       </button>
                     </div>
                   )}

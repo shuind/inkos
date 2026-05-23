@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deriveActiveBookId, isBookCreateChatRoute } from "./App";
+import { deriveActiveBookId } from "./App";
 
 describe("deriveActiveBookId", () => {
   it("returns the current book across book-centered routes", () => {
@@ -14,12 +14,5 @@ describe("deriveActiveBookId", () => {
     expect(deriveActiveBookId({ page: "dashboard" })).toBeUndefined();
     expect(deriveActiveBookId({ page: "services" })).toBeUndefined();
     expect(deriveActiveBookId({ page: "style" })).toBeUndefined();
-  });
-});
-
-describe("isBookCreateChatRoute", () => {
-  it("routes new-book creation through chat instead of the standalone form page", () => {
-    expect(isBookCreateChatRoute({ page: "book-create" })).toBe(true);
-    expect(isBookCreateChatRoute({ page: "book", bookId: "alpha" })).toBe(false);
   });
 });

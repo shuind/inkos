@@ -15,6 +15,8 @@ import { LogViewer } from "./pages/LogViewer";
 import { GenreManager } from "./pages/GenreManager";
 import { StyleManager } from "./pages/StyleManager";
 import { ImportManager } from "./pages/ImportManager";
+import { CreativeBookCreate } from "./pages/CreativeBookCreate";
+import { CreativeWorkbench } from "./pages/CreativeWorkbench";
 import { RadarView } from "./pages/RadarView";
 import { DoctorView } from "./pages/DoctorView";
 import { LanguageSelector } from "./pages/LanguageSelector";
@@ -24,7 +26,7 @@ import { useSessionEvents } from "./hooks/use-session-events";
 import { useTheme } from "./hooks/use-theme";
 import { useI18n } from "./hooks/use-i18n";
 import { postApi, putApi, useApi } from "./hooks/use-api";
-import { Sun, Moon } from "lucide-react";
+import { ClipboardPaste, Sun, Moon } from "lucide-react";
 import { House } from "lucide-react";
 
 export type { HashRoute as Route } from "./hooks/use-hash-route";
@@ -32,10 +34,6 @@ export type { HashRoute as Route } from "./hooks/use-hash-route";
 export function deriveActiveBookId(route: HashRoute): string | undefined {
   if ("bookId" in route) return route.bookId;
   return undefined;
-}
-
-export function isBookCreateChatRoute(route: HashRoute): boolean {
-  return route.page === "book-create";
 }
 
 export function App() {
@@ -69,6 +67,7 @@ export function App() {
     toChat: () => setRoute({ page: "chat" }),
     toBook: (bookId: string) => setRoute({ page: "book", bookId }),
     toBookSettings: (bookId: string) => setRoute({ page: "book-settings", bookId }),
+    toWorkbench: (bookId: string) => setRoute({ page: "workbench", bookId }),
     toBookCreate: () => setRoute({ page: "book-create" }),
     toChapter: (bookId: string, chapterNumber: number) =>
       setRoute({ page: "chapter", bookId, chapterNumber }),
@@ -135,6 +134,19 @@ export function App() {
           </div>
 
           <div className="flex items-center gap-3">
+            {activeBookId && (
+              <button
+                onClick={() => nav.toWorkbench(activeBookId)}
+                className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-semibold transition-colors ${
+                  route.page === "workbench"
+                    ? "border-primary/30 bg-primary/10 text-primary"
+                    : "border-border/50 bg-card/70 text-foreground hover:bg-secondary/50"
+                }`}
+              >
+                <ClipboardPaste size={14} />
+                <span>创作工作台</span>
+              </button>
+            )}
             <div className="flex gap-0.5 bg-muted/50 rounded-md p-0.5">
               <button
                 onClick={async () => {
@@ -172,14 +184,12 @@ export function App() {
               <Dashboard nav={nav} sse={sse} theme={theme} t={t} />
             </div>
           )}
-          {isBookCreateChatRoute(route) && (
-            <div className="absolute inset-0 flex min-w-0">
-              <ChatPage
-                mode="book-create"
+          {route.page === "book-create" && (
+            <div className="max-w-6xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
+              <CreativeBookCreate
                 nav={nav}
                 theme={theme}
                 t={t}
-                sse={sse}
               />
             </div>
           )}
@@ -211,6 +221,11 @@ export function App() {
           {route.page === "book-settings" && (
             <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
               <BookDetail bookId={route.bookId} nav={nav} theme={theme} t={t} sse={sse} />
+            </div>
+          )}
+          {route.page === "workbench" && (
+            <div className="max-w-7xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
+              <CreativeWorkbench bookId={route.bookId} nav={nav} theme={theme} t={t} />
             </div>
           )}
           {route.page === "chapter" && (

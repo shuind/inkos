@@ -24,7 +24,8 @@ import {
   RefreshCw,
   Sparkles,
   Trash2,
-  Save
+  Save,
+  ClipboardPaste
 } from "lucide-react";
 
 interface ChapterMeta {
@@ -55,6 +56,7 @@ type BookStatus = "active" | "paused" | "outlining" | "completed" | "dropped";
 
 interface Nav {
   toDashboard: () => void;
+  toWorkbench: (id: string) => void;
   toChapter: (bookId: string, num: number) => void;
   toAnalytics: (bookId: string) => void;
   toTruth: (bookId: string) => void;
@@ -352,6 +354,13 @@ export function BookDetail({
           >
             {writing ? <div className="w-4 h-4 border-2 border-primary-foreground/20 border-t-primary-foreground rounded-full animate-spin" /> : <Zap size={16} />}
             {writing ? t("dash.writing") : t("book.writeNext")}
+          </button>
+          <button
+            onClick={() => nav.toWorkbench(bookId)}
+            className="flex items-center gap-2 px-5 py-2.5 text-sm font-bold bg-secondary text-foreground rounded-xl hover:bg-secondary/80 transition-all border border-border/50"
+          >
+            <ClipboardPaste size={16} />
+            创作工作台
           </button>
           <button
             onClick={handleDraft}

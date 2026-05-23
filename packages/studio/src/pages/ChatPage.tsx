@@ -25,6 +25,7 @@ import {
   ArrowUp,
   ChevronDown,
   Check,
+  ClipboardPaste,
 } from "lucide-react";
 import { Shimmer } from "../components/ai-elements/shimmer";
 import {
@@ -47,6 +48,7 @@ import {
 interface Nav {
   toDashboard: () => void;
   toBook: (id: string) => void;
+  toWorkbench: (id: string) => void;
   toServices: () => void;
 }
 
@@ -385,7 +387,17 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
 
       {/* Quick actions (only when a book is active) */}
       {hasBook && (
-        <div className="shrink-0 max-w-3xl mx-auto w-full px-4">
+        <div className="shrink-0 max-w-3xl mx-auto w-full px-4 space-y-2">
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={() => activeBookId && nav.toWorkbench(activeBookId)}
+              className="inline-flex items-center gap-2 rounded-lg border border-primary/20 bg-primary/10 px-3 py-1.5 text-xs font-bold text-primary hover:bg-primary/15 transition-colors"
+            >
+              <ClipboardPaste size={14} />
+              <span>创作工作台</span>
+            </button>
+          </div>
           <QuickActions
             onAction={handleQuickAction}
             disabled={loading || !activeSessionId}

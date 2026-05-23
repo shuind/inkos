@@ -13,6 +13,8 @@ import {
   resolveDraftInstruction,
   waitForBookReady,
 } from "./BookCreate";
+import { buildCandidateRedoPrompt, buildCurrentSituationGeminiPrompt, defaultStartup } from "./CreativeBookCreate";
+import { pickWorkbenchTargetChapter, splitChapterMarkdown } from "./CreativeWorkbench";
 
 describe("pickValidValue", () => {
   it("keeps the current value when it is still available", () => {
@@ -254,5 +256,139 @@ describe("buildCreationDraftSummary", () => {
       { key: "blurb", label: "简介", value: "一个做灰产生意的人，准备在夜港洗白，却先被旧账拖回去。" },
       { key: "nextQuestion", label: "下一步", value: "卷一先查账还是先砸场？" },
     ]);
+  });
+});
+
+describe("pickWorkbenchTargetChapter", () => {
+  it("prefers the latest non-approved chapter and otherwise uses the next chapter", () => {
+    expect(pickWorkbenchTargetChapter({
+      nextChapter: 4,
+      chapters: [
+        { number: 1, title: "一", status: "approved", wordCount: 3000 },
+        { number: 2, title: "二", status: "needs-revision", wordCount: 2600 },
+        { number: 3, title: "三", status: "drafted", wordCount: 2400 },
+      ],
+    })).toBe(3);
+
+    expect(pickWorkbenchTargetChapter({
+      nextChapter: 4,
+      chapters: [
+        { number: 1, title: "一", status: "approved", wordCount: 3000 },
+        { number: 2, title: "二", status: "approved", wordCount: 2600 },
+      ],
+    })).toBe(4);
+  });
+});
+
+describe("splitChapterMarkdown", () => {
+  it("loads an existing chapter into title and editable body", () => {
+    expect(splitChapterMarkdown("# 第3章 雨夜账本\n\n正文第一段。\n\n正文第二段。", 3)).toEqual({
+      title: "雨夜账本",
+      content: "正文第一段。\n\n正文第二段。",
+    });
+  });
+});
+
+describe("buildCandidateRedoPrompt", () => {
+  it("turns an unsatisfying candidate into a concrete Gemini redo prompt", () => {
+    const startup = {
+      ...defaultStartup(new Date("2026-05-21T09:00:00.000Z")),
+      volume1: {
+        ...defaultStartup(new Date("2026-05-21T09:00:00.000Z")).volume1,
+        goal: "主角要查清第一卷契约失效的原因。",
+        opposition: "当前只有一串反派名单。",
+        opening: "从守阵失败切入。",
+      },
+    };
+
+    const prompt = buildCandidateRedoPrompt({
+      id: "c1",
+      kind: "explicit",
+      targetPath: "volume1.opposition",
+      label: "对立势力/人物",
+      value: "天道、守阵执事秦庚、陆昭真人、宋玉。",
+      evidence: "Gemini 输出的名单。",
+      status: "rejected",
+    }, startup);
+
+    expect(prompt).toContain("只围绕第一卷");
+    expect(prompt).toContain("不要只列名单");
+    expect(prompt).toContain("第一次冲突场景");
+    expect(prompt).toContain("升级链条");
+    expect(prompt).toContain("天道、守阵执事秦庚、陆昭真人、宋玉");
+  });
+});
+
+describe("buildCurrentSituationGeminiPrompt", () => {
+  it("summarizes the current reviewed state for Gemini", () => {
+    const startup = {
+      ...defaultStartup(new Date("2026-05-21T09:00:00.000Z")),
+      book: {
+        ...defaultStartup(new Date("2026-05-21T09:00:00.000Z")).book,
+        title: "夜港账本",
+        genre: "都市悬疑",
+        blurb: "前审计员追查旧账。",
+      },
+      stable: {
+        ...defaultStartup(new Date("2026-05-21T09:00:00.000Z")).stable,
+        premise: "旧账牵出港城阴谋。",
+        protagonist: "林昭，前审计员。",
+      },
+      volume1: {
+        ...defaultStartup(new Date("2026-05-21T09:00:00.000Z")).volume1,
+        coreHook: "第一卷围绕旧账源头。",
+        goal: "找到第一本账本来源。",
+        opposition: "港城利益链。",
+        opening: "雨夜收到旧账本。",
+        suspense: "账本主人是谁？",
+      },
+      chapters: defaultStartup(new Date("2026-05-21T09:00:00.000Z")).chapters.map((chapter, index) => (
+        index === 0
+          ? { ...chapter, title: "雨夜账本", problem: "账本出现。", hook: "缺页指向旧同事。" }
+          : chapter
+      )),
+      followups: {
+        questions: ["主角不查账本会失去什么？"],
+        geminiPrompt: "请补第一卷反派动机。",
+        suggestions: ["让反派与旧案绑定。"],
+      },
+    };
+
+    const prompt = buildCurrentSituationGeminiPrompt(startup, [
+      {
+        id: "c1",
+        kind: "explicit",
+        targetPath: "stable.protagonist",
+        label: "主角",
+        value: "林昭，前审计员。",
+        evidence: "原文明确。",
+        status: "accepted",
+      },
+      {
+        id: "c2",
+        kind: "gap",
+        targetPath: "volume1.stakes",
+        label: "缺口",
+        value: "还没想清楚主角不查账本会失去什么。",
+        evidence: "原文缺失。",
+        status: "pending",
+      },
+      {
+        id: "c3",
+        kind: "conflict",
+        targetPath: "volume1.opposition",
+        label: "对立势力",
+        value: "名单太空泛。",
+        evidence: "只列名单没有情节。",
+        status: "rejected",
+      },
+    ]);
+
+    expect(prompt).toContain("现阶段只处理第一卷");
+    expect(prompt).toContain("已接受为当前事实的候选");
+    expect(prompt).toContain("仍需处理的缺口/冲突/待定项");
+    expect(prompt).toContain("已拒绝或不满意");
+    expect(prompt).toContain("近 10 章问题链草稿");
+    expect(prompt).toContain("夜港账本");
   });
 });

@@ -21,8 +21,20 @@ export function deriveInvalidationPaths(path: string): ReadonlyArray<string> {
   const normalized = buildApiUrl(path);
   if (!normalized) return [];
 
-  if (normalized === "/api/v1/books/create") {
+  if (
+    normalized === "/api/v1/books/create"
+    || normalized === "/api/v1/books/workbench-create"
+    || /^\/api\/v1\/creative-drafts\/[^/]+\/create-book$/u.test(normalized)
+  ) {
     return ["/api/v1/books"];
+  }
+
+  if (normalized === "/api/v1/creative-drafts") {
+    return ["/api/v1/creative-drafts/latest"];
+  }
+
+  if (/^\/api\/v1\/creative-drafts\/[^/]+\/(analyze|analysis)$/u.test(normalized)) {
+    return ["/api/v1/creative-drafts/latest"];
   }
 
   if (normalized === "/api/v1/project") {

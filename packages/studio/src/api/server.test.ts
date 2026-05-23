@@ -536,6 +536,926 @@ describe("createStudioServer daemon lifecycle", () => {
     );
   });
 
+  it("builds a Gemini chapter-generation prompt from current consensus without calling LLM", async () => {
+    const bookDir = join(root, "books", "demo-book");
+    const storyDir = join(bookDir, "story");
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "current_state.md"), "# Current State\n\n作品：《旧账本》\n\n- 主角：林昭，前审计员，正在追查旧账本。\n\n## 工作台确认：旧提示词\n\n请输出：正文改进方案、设定风险、下一段冲突链。\n", "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n\n- 账本缺页是谁拿走。\n", "utf-8"),
+      writeFile(join(storyDir, "outline", "story_frame.md"), "# Story Frame\n\n第一卷围绕旧账本展开。\n", "utf-8"),
+      writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume Map\n\n第1章雨夜拿到账本。\n", "utf-8"),
+      writeFile(join(bookDir, "chapters", "0001_雨夜账本.md"), "# 第1章 雨夜账本\n\n雨水砸在铁皮檐口。", "utf-8"),
+    ]);
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/workbench/chapter-prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chapterNumber: 1,
+        draftTitle: "雨夜账本",
+        draftContent: "林昭把账本塞进怀里。",
+        instruction: "加强楼梯口追兵压迫感。",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { targetChapter: number; prompt: string };
+    expect(body.targetChapter).toBe(1);
+    expect(body.prompt).toContain("请为我生成《旧账本》第 1 章正文");
+    expect(body.prompt).toContain("林昭把账本塞进怀里");
+    expect(body.prompt).toContain("主角：林昭，前审计员");
+    expect(body.prompt).toContain("第一卷围绕旧账本展开");
+    expect(body.prompt).toContain("加强楼梯口追兵压迫感");
+    expect(body.prompt).not.toContain("旧提示词");
+    expect(body.prompt).not.toContain("请输出：正文改进方案");
+    expect(chatCompletionMock).not.toHaveBeenCalled();
+  });
+
+  it("stores workbench paste without LLM, organizes into an action plan, applies actions, and archives the round", async () => {
+    const bookDir = join(root, "books", "demo-book");
+    const storyDir = join(bookDir, "story");
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "current_state.md"), "# Current State\n\n林昭：前审计员，丈夫没有背叛她。\n", "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n\n- 账本缺页是谁拿走。\n", "utf-8"),
+      writeFile(join(storyDir, "outline", "story_frame.md"), "# Story Frame\n\n第一卷围绕旧账本展开。\n", "utf-8"),
+      writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume Map\n\n第1章雨夜拿到账本。\n", "utf-8"),
+    ]);
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const paste = await app.request("http://localhost/api/v1/books/demo-book/workbench/paste", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceName: "Gemini 官网",
+        text: [
+          "# 第1章 雨夜账本",
+          "",
+          "雨水顺着旧楼的铁皮檐口往下砸。",
+          "林昭把账本塞进怀里，听见楼梯口有人喊她的名字。",
+          "",
+          "## 人设",
+          "",
+          "林昭：前审计员，被丈夫背叛后开始反查账本。",
+        ].join("\n"),
+      }),
+    });
+
+    expect(paste.status).toBe(200);
+    const pasteBody = await paste.json() as {
+      entry: {
+        id: string;
+        rawPath: string;
+        analysisPath: string;
+        rawText: string;
+        actionPlan: {
+          status: string;
+          items: Array<{ id: string; type: string; status: string }>;
+          rawBlockCount: number;
+          hiddenBlockCount: number;
+        };
+      };
+    };
+    expect(pasteBody.entry.rawPath).toMatch(/^inbox\//);
+    expect(pasteBody.entry.analysisPath).toMatch(/^workspace\//);
+    expect(pasteBody.entry.rawText).toContain("林昭：前审计员");
+    expect(pasteBody.entry.actionPlan.status).toBe("raw_saved");
+    expect(pasteBody.entry.actionPlan.rawBlockCount).toBeGreaterThan(0);
+    expect(chatCompletionMock).not.toHaveBeenCalled();
+
+    await expect(readFile(join(root, "books", "demo-book", pasteBody.entry.rawPath), "utf-8")).resolves.toContain("雨夜账本");
+
+    chatCompletionMock.mockResolvedValueOnce({
+      content: JSON.stringify({
+        status: "organized",
+        targetChapter: 1,
+        summary: "本轮需要应用正文、确认林昭人物状态，并拍板丈夫是否背叛。",
+        items: [
+          {
+            id: "draft-01",
+            type: "draft",
+            title: "第1章 雨夜账本",
+            sourceEvidence: "Gemini 给出雨夜拿到账本的开场正文。",
+            status: "pending",
+            payload: {
+              targetChapter: 1,
+              content: "# 第1章 雨夜账本\n\n雨水顺着旧楼的铁皮檐口往下砸。",
+            },
+          },
+          {
+            id: "setting-01",
+            type: "setting",
+            title: "林昭人物状态",
+            sourceEvidence: "原文人设段明确写出。",
+            status: "pending",
+            payload: {
+              targetFile: "story/current_state.md",
+              content: "林昭：前审计员，被丈夫背叛后开始反查账本。",
+            },
+          },
+          {
+            id: "decision-keep-01",
+            type: "decision",
+            title: "丈夫是否背叛",
+            sourceEvidence: "Gemini 新内容说丈夫背叛。",
+            status: "pending",
+            payload: {
+              subject: "丈夫是否背叛",
+              currentConsensus: "林昭：前审计员，丈夫没有背叛她。",
+              newContent: "林昭被丈夫背叛后开始反查账本。",
+              reason: "当前共识和 Gemini 新内容矛盾，必须选择一种人物动机。",
+              targetFile: "story/current_state.md",
+              options: ["keep_current", "adopt_new", "manual", "defer"],
+            },
+          },
+          {
+            id: "decision-adopt-01",
+            type: "decision",
+            title: "账本缺页去向",
+            sourceEvidence: "Gemini 新内容说缺页在旧仓库。",
+            status: "pending",
+            payload: {
+              subject: "账本缺页去向",
+              currentConsensus: "账本缺页是谁拿走尚未确定。",
+              newContent: "账本缺页藏在旧仓库保险箱。",
+              reason: "伏笔去向会影响第一卷追查线。",
+              targetFile: "story/pending_hooks.md",
+              options: ["keep_current", "adopt_new", "manual", "defer"],
+            },
+          },
+          {
+            id: "prompt-01",
+            type: "prompt",
+            title: "追问第一场冲突",
+            sourceEvidence: "第一章开场压力不足。",
+            status: "pending",
+            payload: {
+              content: "请围绕楼梯口追兵补一版第一场冲突。",
+            },
+          },
+        ],
+        nextPrompt: "请围绕楼梯口追兵补一版第一场冲突。",
+        rawBlockCount: 2,
+        hiddenBlockCount: 0,
+      }),
+      usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+    });
+
+    const organize = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}/organize`, {
+      method: "POST",
+    });
+    expect(organize.status).toBe(200);
+    expect(chatCompletionMock).toHaveBeenCalledOnce();
+    const organizeMessages = chatCompletionMock.mock.calls[0]?.[2] as Array<{ role: string; content: string }>;
+    expect(organizeMessages[1]?.content).toContain("consensusSnapshot");
+    expect(organizeMessages[1]?.content).toContain("丈夫没有背叛她");
+    const organizeBody = await organize.json() as {
+      entry: {
+        actionPlan: {
+          status: string;
+          summary: string;
+          nextPrompt: string;
+          items: Array<{
+            id: string;
+            type: "draft" | "setting" | "decision" | "prompt";
+            title: string;
+            status: string;
+            payload: Record<string, unknown>;
+          }>;
+        };
+      };
+    };
+    expect(organizeBody.entry.actionPlan).toMatchObject({
+      status: "organized",
+      summary: "本轮需要应用正文、确认林昭人物状态，并拍板丈夫是否背叛。",
+      nextPrompt: "请围绕楼梯口追兵补一版第一场冲突。",
+    });
+    expect(organizeBody.entry.actionPlan.items.map((item) => item.type)).toEqual([
+      "draft",
+      "setting",
+      "decision",
+      "decision",
+      "prompt",
+    ]);
+
+    const draftApply = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}/actions/draft-01/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "accept" }),
+    });
+    expect(draftApply.status).toBe(200);
+    await expect(draftApply.json()).resolves.toMatchObject({
+      actionPlan: {
+        items: expect.arrayContaining([
+          expect.objectContaining({ id: "draft-01", status: "accepted" }),
+        ]),
+      },
+    });
+    expect(saveChapterIndexMock).not.toHaveBeenCalled();
+
+    const keepCurrent = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}/actions/decision-keep-01/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "keep_current" }),
+    });
+    expect(keepCurrent.status).toBe(200);
+    await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.not.toContain("工作台确认：丈夫是否背叛");
+
+    const settingApply = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}/actions/setting-01/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "accept" }),
+    });
+    expect(settingApply.status).toBe(200);
+    await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toContain("林昭：前审计员，被丈夫背叛后开始反查账本。");
+
+    const adoptDecision = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}/actions/decision-adopt-01/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "adopt_new" }),
+    });
+    expect(adoptDecision.status).toBe(200);
+    await expect(readFile(join(storyDir, "pending_hooks.md"), "utf-8")).resolves.toContain("账本缺页藏在旧仓库保险箱");
+
+    const updateActionPlan = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}/action-plan`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        actionPlan: {
+          ...organizeBody.entry.actionPlan,
+          items: organizeBody.entry.actionPlan.items.map((item) =>
+            item.id === "prompt-01"
+              ? {
+                  ...item,
+                  payload: {
+                    ...item.payload,
+                    content: "请把第一场冲突改成账本缺页引发的追逐。",
+                  },
+                }
+              : item,
+          ),
+        },
+      }),
+    });
+    expect(updateActionPlan.status).toBe(200);
+    await expect(updateActionPlan.json()).resolves.toMatchObject({
+      actionPlan: {
+        items: expect.arrayContaining([
+          expect.objectContaining({
+            id: "prompt-01",
+            payload: expect.objectContaining({ content: "请把第一场冲突改成账本缺页引发的追逐。" }),
+          }),
+        ]),
+      },
+    });
+
+    const archive = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}/archive`, {
+      method: "POST",
+    });
+    expect(archive.status).toBe(200);
+    await expect(archive.json()).resolves.toMatchObject({
+      actionPlan: expect.objectContaining({ status: "archived" }),
+    });
+
+    const list = await app.request("http://localhost/api/v1/books/demo-book/workbench");
+    expect(list.status).toBe(200);
+    await expect(list.json()).resolves.toMatchObject({
+      entries: [
+        expect.objectContaining({
+          id: pasteBody.entry.id,
+          sourceName: "Gemini 官网",
+          status: "archived",
+        }),
+      ],
+    });
+  });
+
+  it("keeps DeepSeek advisor chat as discussion until it is converted into confirmed workbench actions", async () => {
+    const bookDir = join(root, "books", "demo-book");
+    const storyDir = join(bookDir, "story");
+    await mkdir(join(storyDir, "outline"), { recursive: true });
+    await Promise.all([
+      writeFile(join(storyDir, "current_state.md"), "# Current State\n\n顾慎：外貌十八九岁，真实年龄约一百岁。\n", "utf-8"),
+      writeFile(join(storyDir, "pending_hooks.md"), "# Pending Hooks\n\n- 庄悬墨是否会发现顾慎外貌异常。\n", "utf-8"),
+      writeFile(join(storyDir, "outline", "story_frame.md"), "# Story Frame\n\n长生秘密不能过早暴露。\n", "utf-8"),
+      writeFile(join(storyDir, "outline", "volume_map.md"), "# Volume Map\n\n第4章：测天盘在顾慎住处附近产生波动；旧写法说长生秘密暴露。\n", "utf-8"),
+      writeFile(join(bookDir, "chapters", "0004_天仪阁的指针.md"), "# 第4章 天仪阁的指针\n\n庄悬墨抬头看向外山。", "utf-8"),
+    ]);
+    const originalCurrentState = await readFile(join(storyDir, "current_state.md"), "utf-8");
+    const originalVolumeMap = await readFile(join(storyDir, "outline", "volume_map.md"), "utf-8");
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const latest = await app.request("http://localhost/api/v1/books/demo-book/workbench/advisor/latest");
+    expect(latest.status).toBe(200);
+    await expect(latest.json()).resolves.toEqual({ thread: null });
+    expect(chatCompletionMock).not.toHaveBeenCalled();
+
+    chatCompletionMock.mockResolvedValueOnce({
+      content: [
+        "## 我查到的上下文",
+        "第4章旧写法把测天盘风险说成直接暴露长生秘密，但当前状态只稳定记录了顾慎外貌十八九岁、真实年龄约一百岁。",
+        "## 我的判断",
+        "应该把风险收窄为外貌、气机、登记年限不匹配，暂时不要写成完整长生秘密暴露。",
+        "## 建议方案",
+        "修改第4章阻力表述，让庄悬墨只抓到异常线索。",
+        "## 可能影响",
+        "这样能保留压迫感，也避免第一卷过早掀底牌。",
+        "## 是否整理成待确认修改",
+        "可以整理成一条待确认设定修改。",
+      ].join("\n\n"),
+      usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+    });
+
+    const advisor = await app.request("http://localhost/api/v1/books/demo-book/workbench/advisor/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: "第4章这里长生秘密暴露太直接，我觉得暂时只是外貌没变。",
+      }),
+    });
+    expect(advisor.status).toBe(200);
+    expect(chatCompletionMock).toHaveBeenCalledOnce();
+    const advisorMessages = chatCompletionMock.mock.calls[0]?.[2] as Array<{ role: string; content: string }>;
+    expect(advisorMessages[1]?.content).toContain("consensusSnapshot");
+    expect(advisorMessages[1]?.content).toContain("顾慎：外貌十八九岁");
+    expect(advisorMessages[1]?.content).toContain("长生秘密不能过早暴露");
+    const advisorBody = await advisor.json() as {
+      thread: {
+        id: string;
+        messages: Array<{
+          role: "user" | "assistant";
+          content: string;
+          contextRefs?: Array<{ file: string; label: string; excerpt: string }>;
+        }>;
+      };
+    };
+    expect(advisorBody.thread.messages).toHaveLength(2);
+    expect(advisorBody.thread.messages[1]).toMatchObject({
+      role: "assistant",
+      content: expect.stringContaining("我查到的上下文"),
+      contextRefs: expect.arrayContaining([
+        expect.objectContaining({ file: "story/current_state.md", excerpt: expect.stringContaining("顾慎：外貌十八九岁") }),
+        expect.objectContaining({ file: "story/outline/volume_map.md", excerpt: expect.stringContaining("长生秘密暴露") }),
+      ]),
+    });
+    await expect(readFile(join(storyDir, "current_state.md"), "utf-8")).resolves.toBe(originalCurrentState);
+    await expect(readFile(join(storyDir, "outline", "volume_map.md"), "utf-8")).resolves.toBe(originalVolumeMap);
+
+    chatCompletionMock.mockResolvedValueOnce({
+      content: JSON.stringify({
+        status: "organized",
+        targetChapter: 4,
+        summary: "把第4章暴露风险收窄为外貌异常。",
+        items: [
+          {
+            id: "advisor-action-01",
+            type: "setting",
+            title: "第4章暴露风险收窄",
+            sourceEvidence: "作者认为暂时只暴露外貌年轻没变过，顾问判断不应过早暴露完整长生秘密。",
+            status: "pending",
+            payload: {
+              targetFile: "story/outline/volume_map.md",
+              content: "第4章阻力：测天盘不能直接证明长生，只会发现顾慎外貌、气机、登记年限不匹配。",
+            },
+          },
+        ],
+        nextPrompt: "",
+        rawBlockCount: 0,
+        hiddenBlockCount: 0,
+      }),
+      usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+    });
+
+    const actionPlan = await app.request(`http://localhost/api/v1/books/demo-book/workbench/advisor/${advisorBody.thread.id}/action-plan`, {
+      method: "POST",
+    });
+    expect(actionPlan.status).toBe(200);
+    expect(chatCompletionMock).toHaveBeenCalledTimes(2);
+    const planMessages = chatCompletionMock.mock.calls[1]?.[2] as Array<{ role: string; content: string }>;
+    expect(planMessages[1]?.content).toContain("advisorMessages");
+    const actionPlanBody = await actionPlan.json() as {
+      entry: {
+        id: string;
+        sourceName: string;
+        rawPath: string;
+        actionPlan: {
+          items: Array<{ id: string; type: string; status: string; payload: Record<string, unknown> }>;
+        };
+      };
+    };
+    expect(actionPlanBody.entry).toMatchObject({
+      sourceName: "DeepSeek 顾问",
+      rawPath: expect.stringMatching(/^workspace\/advisor\//),
+      actionPlan: {
+        items: [
+          expect.objectContaining({
+            id: "advisor-action-01",
+            type: "setting",
+            status: "pending",
+          }),
+        ],
+      },
+    });
+    await expect(readFile(join(root, "books", "demo-book", actionPlanBody.entry.rawPath), "utf-8")).resolves.toContain("DeepSeek 顾问");
+    await expect(readFile(join(storyDir, "outline", "volume_map.md"), "utf-8")).resolves.toBe(originalVolumeMap);
+
+    const apply = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${actionPlanBody.entry.id}/actions/advisor-action-01/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "accept" }),
+    });
+    expect(apply.status).toBe(200);
+    await expect(readFile(join(storyDir, "outline", "volume_map.md"), "utf-8"))
+      .resolves.toContain("测天盘不能直接证明长生");
+  });
+
+  it("keeps old digest workbench data readable as an action plan", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const paste = await app.request("http://localhost/api/v1/books/demo-book/workbench/paste", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceName: "Gemini 官网",
+        text: "# 第1章 雨夜账本\n\n雨水顺着旧楼的铁皮檐口往下砸。",
+      }),
+    });
+
+    expect(paste.status).toBe(200);
+    const pasteBody = await paste.json() as {
+      entry: {
+        id: string;
+        analysisPath: string;
+        rawText: string;
+        rawPath: string;
+        rawCharCount: number;
+        blocks: unknown[];
+        sourceName: string;
+        createdAt: string;
+      };
+    };
+    const legacyEntry = {
+      id: pasteBody.entry.id,
+      sourceName: pasteBody.entry.sourceName,
+      createdAt: pasteBody.entry.createdAt,
+      rawPath: pasteBody.entry.rawPath,
+      analysisPath: pasteBody.entry.analysisPath,
+      rawCharCount: pasteBody.entry.rawCharCount,
+      rawText: pasteBody.entry.rawText,
+      blocks: pasteBody.entry.blocks,
+      settingCandidates: [],
+      digest: {
+        status: "organized",
+        updatedAt: "2026-05-21T00:00:00.000Z",
+        draftCandidate: {
+          title: "第1章 雨夜账本",
+          content: "# 第1章 雨夜账本\n\n旧楼雨声压下来。",
+          sourceBlockIds: ["block-01"],
+        },
+        settingChanges: [],
+        gaps: [],
+        nextPrompt: "继续补第一章追兵。",
+        rawBlockCount: 1,
+        hiddenBlockCount: 0,
+      },
+    };
+    await writeFile(join(root, "books", "demo-book", pasteBody.entry.analysisPath), JSON.stringify(legacyEntry, null, 2), "utf-8");
+
+    const detail = await app.request(`http://localhost/api/v1/books/demo-book/workbench/${pasteBody.entry.id}`);
+    expect(detail.status).toBe(200);
+    await expect(detail.json()).resolves.toMatchObject({
+      entry: {
+        actionPlan: {
+          status: "organized",
+          items: [
+            expect.objectContaining({
+              type: "draft",
+              title: "第1章 雨夜账本",
+            }),
+            expect.objectContaining({
+              type: "prompt",
+            }),
+          ],
+        },
+      },
+    });
+  });
+
+  it("saves workbench chapter edits into the selected chapter instead of always appending", async () => {
+    loadChapterIndexMock.mockResolvedValueOnce([
+      {
+        number: 3,
+        title: "Demo",
+        status: "needs-revision",
+        wordCount: 4,
+        createdAt: "2026-04-12T00:00:00.000Z",
+        updatedAt: "2026-04-12T00:00:00.000Z",
+        auditIssues: ["旧问题"],
+        lengthWarnings: [],
+      },
+    ]);
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const save = await app.request("http://localhost/api/v1/books/demo-book/workbench/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target: "chapter",
+        chapterNumber: 3,
+        title: "雨夜账本重写",
+        content: "更新后的正文。",
+        kind: "chapter",
+      }),
+    });
+
+    expect(save.status).toBe(200);
+    await expect(save.json()).resolves.toMatchObject({
+      chapterNumber: 3,
+      path: "chapters/0003_Demo.md",
+      title: "雨夜账本重写",
+    });
+    await expect(readFile(join(root, "books", "demo-book", "chapters", "0003_Demo.md"), "utf-8"))
+      .resolves.toContain("# 第3章 雨夜账本重写");
+    expect(saveChapterIndexMock).toHaveBeenCalledWith("demo-book", [
+      expect.objectContaining({
+        number: 3,
+        title: "雨夜账本重写",
+        status: "drafted",
+        auditIssues: ["旧问题"],
+      }),
+    ]);
+  });
+
+  it("creates a workbench-first book skeleton without invoking the AI create flow", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/workbench-create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        title: "Night Ledger",
+        genre: "urban",
+        platform: "qidian",
+        language: "zh",
+        targetChapters: 120,
+        chapterWordCount: 2600,
+        blurb: "A fixer follows old accounts through a port city.",
+        guideFields: [
+          { key: "logline", label: "一句话故事", value: "主角查旧账洗白，却发现港城账本牵出更大阴谋。" },
+          { key: "protagonist", label: "主人公是谁", value: "前审计员林昭。" },
+          { key: "goal", label: "主人公要做什么", value: "找到账本源头。" },
+          { key: "suspense", label: "超级悬念", value: "账本真正主人是谁？" },
+        ],
+        checkpoints: [
+          { label: "关卡 1", problem: "账本缺页。", solution: "找到旧仓库。", reversal: "仓库被人提前清空。" },
+        ],
+        pasteText: "# Gemini 构思\n\n第一章从雨夜账本切入。",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      bookId: "night-ledger",
+      book: expect.objectContaining({
+        id: "night-ledger",
+        title: "Night Ledger",
+        status: "incubating",
+        chaptersWritten: 0,
+      }),
+    });
+    expect(processProjectInteractionRequestMock).not.toHaveBeenCalled();
+    expect(createInteractionToolsFromDepsMock).not.toHaveBeenCalled();
+
+    const bookDir = join(root, "books", "night-ledger");
+    await expect(readFile(join(bookDir, "book.json"), "utf-8")).resolves.toContain('"status": "incubating"');
+    await expect(readFile(join(bookDir, "chapters", "index.json"), "utf-8")).resolves.toBe("[]\n");
+    const creationGuide = await readFile(join(bookDir, "workspace", "creation-guide.md"), "utf-8");
+    expect(creationGuide).toContain("主角查旧账洗白");
+    expect(creationGuide).toContain("平台：起点中文网");
+    expect(creationGuide).not.toContain("平台：qidian");
+    await expect(readFile(join(bookDir, "story", "outline", "story_frame.md"), "utf-8")).resolves.toContain("五问构思法");
+    await expect(readFile(join(bookDir, "story", "book_rules.md"), "utf-8")).resolves.toContain("工作台");
+    await expect(access(join(bookDir, "story", "outline", "volume_map.md"))).resolves.toBeUndefined();
+
+    const workbenchList = await app.request("http://localhost/api/v1/books/night-ledger/workbench");
+    expect(workbenchList.status).toBe(200);
+    await expect(workbenchList.json()).resolves.toMatchObject({
+      entries: [
+        expect.objectContaining({
+          sourceName: "建书粘贴",
+        }),
+      ],
+    });
+  });
+
+  it("saves creative drafts without invoking the LLM and returns the latest draft", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const save = await app.request("http://localhost/api/v1/creative-drafts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceName: "Gemini 官网",
+        text: "主角林昭在雨夜拿到账本，第一卷目标是查清账本源头。",
+      }),
+    });
+
+    expect(save.status).toBe(200);
+    const saveBody = await save.json() as { draft: { id: string; text: string } };
+    expect(saveBody.draft.text).toContain("账本");
+    expect(chatCompletionMock).not.toHaveBeenCalled();
+    await expect(readFile(join(root, ".inkos", "creative-drafts", `${saveBody.draft.id}.json`), "utf-8")).resolves.toContain("Gemini 官网");
+
+    const latest = await app.request("http://localhost/api/v1/creative-drafts/latest");
+    expect(latest.status).toBe(200);
+    await expect(latest.json()).resolves.toMatchObject({
+      draft: expect.objectContaining({
+        id: saveBody.draft.id,
+        sourceName: "Gemini 官网",
+      }),
+    });
+  });
+
+  it("analyzes a creative draft only on manual analyze and persists strict JSON output", async () => {
+    chatCompletionMock.mockResolvedValueOnce({
+      content: JSON.stringify({
+        candidates: [
+          {
+            kind: "explicit",
+            targetPath: "book.title",
+            label: "书名",
+            value: "夜港账本",
+            evidence: "粘贴内容直接给出书名。",
+            status: "pending",
+          },
+          {
+            kind: "gap",
+            targetPath: "volume1.stakes",
+            label: "非做不可",
+            value: "还缺主角不查账本会失去什么。",
+            evidence: "原文没有明确代价。",
+            status: "pending",
+          },
+          {
+            kind: "suggestion",
+            targetPath: "volume1.opening",
+            label: "开头切入",
+            value: "从雨夜交易失败切入。",
+            evidence: "由账本和雨夜元素推导。",
+            status: "pending",
+          },
+        ],
+        startup: {
+          book: {
+            title: "夜港账本",
+            genre: "都市悬疑",
+            platform: "qidian",
+            targetChapters: 120,
+            chapterWordCount: 2600,
+            blurb: "前审计员追查港城旧账。",
+          },
+          stable: {
+            premise: "一本旧账牵出港城阴谋。",
+            protagonist: "前审计员林昭。",
+            longTermGoal: "洗清旧案。",
+            style: "冷峻、强情节。",
+            prohibitions: "不写无意义解释。",
+          },
+          volume1: {
+            coreHook: "旧账追凶。",
+            protagonistState: "被迫离职。",
+            goal: "找到第一本账本的来源。",
+            stakes: "",
+            opposition: "港城利益链。",
+            opening: "雨夜账本出现。",
+            endingState: "林昭掌握第一条证据链。",
+            suspense: "账本主人是谁？",
+          },
+          chapters: [
+            {
+              index: 1,
+              title: "雨夜账本",
+              problem: "账本突然出现。",
+              action: "林昭收下账本。",
+              obstacle: "有人追索。",
+              turn: "账本缺页。",
+              result: "她逃离现场。",
+              hook: "缺页上的名字被划掉。",
+            },
+          ],
+          followups: {
+            questions: ["主角不查账本会失去什么？"],
+            geminiPrompt: "请围绕第一卷代价补充3个方案。",
+            suggestions: ["把代价绑定亲人或职业清白。"],
+          },
+        },
+      }),
+      usage: { promptTokens: 10, completionTokens: 20, totalTokens: 30 },
+    });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const save = await app.request("http://localhost/api/v1/creative-drafts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceName: "Gemini", text: "书名《夜港账本》。主角林昭拿到账本。" }),
+    });
+    const saveBody = await save.json() as { draft: { id: string } };
+
+    const analyze = await app.request(`http://localhost/api/v1/creative-drafts/${saveBody.draft.id}/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sourceName: "Gemini", text: "书名《夜港账本》。主角林昭拿到账本。" }),
+    });
+
+    expect(analyze.status).toBe(200);
+    expect(chatCompletionMock).toHaveBeenCalledOnce();
+    await expect(analyze.json()).resolves.toMatchObject({
+      analysis: {
+        candidates: expect.arrayContaining([
+          expect.objectContaining({ kind: "explicit", targetPath: "book.title" }),
+          expect.objectContaining({ kind: "gap", targetPath: "volume1.stakes" }),
+          expect.objectContaining({ kind: "suggestion", targetPath: "volume1.opening" }),
+        ]),
+        startup: {
+          book: expect.objectContaining({ title: "夜港账本" }),
+          followups: expect.objectContaining({ geminiPrompt: "请围绕第一卷代价补充3个方案。" }),
+        },
+      },
+    });
+
+    await expect(readFile(join(root, ".inkos", "creative-drafts", `${saveBody.draft.id}.json`), "utf-8")).resolves.toContain("夜港账本");
+  });
+
+  it("does not overwrite existing creative draft analysis when LLM output is not strict JSON", async () => {
+    chatCompletionMock.mockResolvedValueOnce({
+      content: JSON.stringify({
+        candidates: [],
+        startup: {
+          book: { title: "旧标题", genre: "悬疑", platform: "qidian", targetChapters: 100, chapterWordCount: 2600, blurb: "" },
+          stable: {},
+          volume1: {},
+          chapters: [],
+          followups: {},
+        },
+      }),
+      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    });
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const save = await app.request("http://localhost/api/v1/creative-drafts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "旧草稿" }),
+    });
+    const saveBody = await save.json() as { draft: { id: string } };
+    const first = await app.request(`http://localhost/api/v1/creative-drafts/${saveBody.draft.id}/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "旧草稿" }),
+    });
+    expect(first.status).toBe(200);
+
+    chatCompletionMock.mockResolvedValueOnce({
+      content: "```json\n{\"bad\":true}\n```",
+      usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    });
+    const second = await app.request(`http://localhost/api/v1/creative-drafts/${saveBody.draft.id}/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "旧草稿" }),
+    });
+
+    expect(second.status).toBe(502);
+    await expect(second.json()).resolves.toMatchObject({
+      error: expect.objectContaining({ code: "INVALID_ANALYSIS_JSON" }),
+    });
+    await expect(readFile(join(root, ".inkos", "creative-drafts", `${saveBody.draft.id}.json`), "utf-8")).resolves.toContain("旧标题");
+  });
+
+  it("creates a book from confirmed creative draft startup and keeps unresolved candidates out of authority files", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const save = await app.request("http://localhost/api/v1/creative-drafts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceName: "Gemini 官网",
+        text: "书名夜港账本。主角林昭。缺口：动机还没想清楚。",
+      }),
+    });
+    const saveBody = await save.json() as { draft: { id: string } };
+    const startup = {
+      book: {
+        title: "夜港账本",
+        genre: "都市悬疑",
+        platform: "qidian",
+        targetChapters: 120,
+        chapterWordCount: 2600,
+        blurb: "前审计员追查旧账。",
+      },
+      stable: {
+        premise: "旧账牵出港城阴谋。",
+        protagonist: "林昭，前审计员。",
+        longTermGoal: "洗清旧案。",
+        style: "冷峻、快节奏。",
+        prohibitions: "不写空泛解释。",
+      },
+      volume1: {
+        coreHook: "第一卷围绕旧账源头。",
+        protagonistState: "失业且被怀疑。",
+        goal: "找到第一本账本来源。",
+        stakes: "否则旧案会彻底盖棺。",
+        opposition: "港城利益链。",
+        opening: "雨夜收到旧账本。",
+        endingState: "拿到第一条证据链。",
+        suspense: "账本主人是谁？",
+      },
+      chapters: [
+        {
+          index: 1,
+          title: "雨夜账本",
+          problem: "账本出现。",
+          action: "林昭收下账本。",
+          obstacle: "追索者出现。",
+          turn: "账本缺页。",
+          result: "她逃离现场。",
+          hook: "缺页指向旧同事。",
+        },
+      ],
+      followups: {
+        questions: ["反派为什么急着追回账本？"],
+        geminiPrompt: "请补第一卷反派动机。",
+        suggestions: ["让反派与旧案绑定。"],
+      },
+    };
+    const candidates = [
+      {
+        id: "c1",
+        kind: "explicit",
+        targetPath: "stable.protagonist",
+        label: "主角",
+        value: "林昭，前审计员。",
+        evidence: "原文明确。",
+        status: "accepted",
+      },
+      {
+        id: "c2",
+        kind: "gap",
+        targetPath: "volume1.stakes",
+        label: "缺口",
+        value: "这个缺口不应自动写进权威设定。",
+        evidence: "原文缺失。",
+        status: "pending",
+      },
+    ];
+
+    const create = await app.request(`http://localhost/api/v1/creative-drafts/${saveBody.draft.id}/create-book`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ startup, candidates }),
+    });
+
+    expect(create.status).toBe(200);
+    await expect(create.json()).resolves.toMatchObject({ ok: true, bookId: "夜港账本" });
+    expect(processProjectInteractionRequestMock).not.toHaveBeenCalled();
+
+    const bookDir = join(root, "books", "夜港账本");
+    await expect(readFile(join(bookDir, "book.json"), "utf-8")).resolves.toContain('"status": "incubating"');
+    await expect(readFile(join(bookDir, "chapters", "index.json"), "utf-8")).resolves.toBe("[]\n");
+    const storyFrame = await readFile(join(bookDir, "story", "outline", "story_frame.md"), "utf-8");
+    expect(storyFrame).toContain("旧账牵出港城阴谋");
+    expect(storyFrame).toContain("林昭，前审计员");
+    expect(storyFrame).not.toContain("这个缺口不应自动写进权威设定");
+    const startupMarkdown = await readFile(join(bookDir, "workspace", "creation-guide.md"), "utf-8");
+    expect(startupMarkdown).toContain("平台：起点中文网");
+    expect(startupMarkdown).not.toContain("平台：qidian");
+    await expect(readFile(join(bookDir, "story", "outline", "volume_map.md"), "utf-8")).resolves.toContain("近 10 章问题链");
+    await expect(readFile(join(bookDir, "story", "current_state.md"), "utf-8")).resolves.toContain("失业且被怀疑");
+    await expect(readFile(join(bookDir, "story", "pending_hooks.md"), "utf-8")).resolves.toContain("账本主人是谁");
+
+    const workbenchList = await app.request("http://localhost/api/v1/books/%E5%A4%9C%E6%B8%AF%E8%B4%A6%E6%9C%AC/workbench");
+    expect(workbenchList.status).toBe(200);
+    await expect(workbenchList.json()).resolves.toMatchObject({
+      entries: expect.arrayContaining([
+        expect.objectContaining({ sourceName: "Gemini 官网" }),
+        expect.objectContaining({ sourceName: "建书前整理" }),
+      ]),
+    });
+  });
+
   it("reflects project edits immediately without restarting the studio server", async () => {
     const { createStudioServer } = await import("./server.js");
     const app = createStudioServer(cloneProjectConfig() as never, root);

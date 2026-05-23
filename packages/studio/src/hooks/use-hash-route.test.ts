@@ -23,6 +23,10 @@ describe("hash route", () => {
       expect(parseHash("#/book/my-novel/settings")).toEqual({ page: "book-settings", bookId: "my-novel" });
     });
 
+    it("parses workbench route", () => {
+      expect(parseHash("#/book/my-novel/workbench")).toEqual({ page: "workbench", bookId: "my-novel" });
+    });
+
     it("decodes encoded bookId", () => {
       expect(parseHash("#/book/%E4%B9%9D%E9%BE%99")).toEqual({ page: "book", bookId: "九龙" });
     });
@@ -67,6 +71,10 @@ describe("hash route", () => {
 
     it("book-settings -> #/book/{id}/settings", () => {
       expect(routeToHash({ page: "book-settings", bookId: "novel-1" })).toBe("#/book/novel-1/settings");
+    });
+
+    it("workbench -> #/book/{id}/workbench", () => {
+      expect(routeToHash({ page: "workbench", bookId: "novel-1" })).toBe("#/book/novel-1/workbench");
     });
 
     it("encodes Chinese bookId", () => {

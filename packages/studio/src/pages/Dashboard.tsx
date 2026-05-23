@@ -37,6 +37,7 @@ interface BookSummary {
 interface Nav {
   toBook: (id: string) => void;
   toBookSettings: (id: string) => void;
+  toWorkbench: (id: string) => void;
   toAnalytics: (id: string) => void;
   toBookCreate: () => void;
   toServices: () => void;
@@ -87,6 +88,13 @@ function BookMenu({ bookId, bookTitle, nav, t, onDelete, onOpenChange }: {
       </button>
       {open && (
         <div className="absolute right-0 top-full mt-1 w-44 bg-card border border-border rounded-xl shadow-lg shadow-primary/5 py-1 z-50 fade-in">
+          <button
+            onClick={() => { setOpen(false); nav.toWorkbench(bookId); }}
+            className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-foreground hover:bg-secondary/50 transition-colors cursor-pointer"
+          >
+            <FileInput size={14} className="text-muted-foreground" />
+            创作工作台
+          </button>
           <button
             onClick={() => { setOpen(false); nav.toBookSettings(bookId); }}
             className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-foreground hover:bg-secondary/50 transition-colors cursor-pointer"
@@ -296,6 +304,14 @@ export function Dashboard({ nav, sse, theme, t }: { nav: Nav; sse: { messages: R
                         {t("dash.writeNext")}
                       </>
                     )}
+                  </button>
+                  <button
+                    onClick={() => nav.toWorkbench(book.id)}
+                    className="flex items-center gap-2 px-4 py-3 rounded-xl bg-secondary text-foreground hover:text-primary hover:bg-primary/10 hover:border-primary/30 hover:shadow-md hover:scale-105 active:scale-95 transition-all border border-border/50 shadow-sm text-sm font-bold"
+                    title="创作工作台"
+                  >
+                    <FileInput size={18} />
+                    <span>工作台</span>
                   </button>
                   <button
                     onClick={() => nav.toAnalytics(book.id)}
